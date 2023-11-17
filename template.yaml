@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  This SAM application sets up a static website hosted on an S3 bucket, managed by a custom resource for seamless creation and deletion. It features an API Gateway interfacing with two Lambda functions for data operations with a Kinesis Data Stream. The SendDataFunction handles data ingestion, while PollDataFunction manages data retrieval, utilizing DynamoDB for shard ID tracking. This infrastructure is designed for secure, efficient real-time data processing and static site hosting, optimized for scalability and manageability.
+
+Globals:
+  Function:
+    Timeout: 5
+
+Resources:
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+
+  S3BucketCreationDeletionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/s3-bucket-creation-deletion-function
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - "s3:PutBucketPublicAccessBlock"
+                - "s3:GetBucketPublicAccessBlock"
+                - "s3:PutBucketWebsite"
+                - "s3:ListBucket"
+                - "s3:ListBucketVersions"
+                - "s3:DeleteObject"
+                - "s3:DeleteObjectVersion"
+              Resource:
+                - !GetAtt WebsiteBucket.Arn
+                - !Sub ${WebsiteBucket.Arn}/*
+
+  S3SetupAndTeardownCustomResource:
+    Type: Custom::S3SetupAndTeardownManager
+    Properties:
+      Timeout: 30
+      ServiceToken: !GetAtt S3BucketCreationDeletionFunction.Arn
+      BucketName: !Ref WebsiteBucket
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${WebsiteBucket}/*"
+    DependsOn: S3SetupAndTeardownCustomResource
+
+  MyApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowOrigin: "'*'"
+        AllowMethods: "'GET, POST, PUT'"
+        AllowHeaders: "'Content-Type, Authorization'"
+
+  SendDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/kinesis-send-data
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonKinesisFullAccess
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref MyKinesisStream
+          DYNAMO_DB_TABLE: !Ref DynamoDBTable
+      Events:
+        SendData:
+          Type: Api
+          Properties:
+            Path: /send
+            Method: post
+            RestApiId: !Ref MyApi
+
+  PollDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/kinesis-poll-data
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonKinesisFullAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTable
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref MyKinesisStream
+          DYNAMO_DB_TABLE: !Ref DynamoDBTable
+      Events:
+        PollData:
+          Type: Api
+          Properties:
+            Path: /poll
+            Method: get
+            RestApiId: !Ref MyApi
+
+  MyKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+      RetentionPeriodHours: 24
+
+  DynamoDBTable:
+    Type: AWS::Serverless::SimpleTable
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PrimaryKey:
+        Name: shardId
+        Type: String
+
+Outputs:
+  ApiGatewayUrl:
+    Description: "URL of the Prod stage for MyApi"
+    Value: !Sub "https://${MyApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  BucketName:
+    Description: "Name of the S3 Bucket"
+    Value: !Ref WebsiteBucket
+
+  WebsiteURL:
+    Description: "URL of the website hosted on S3"
+    Value: !Sub "http://${WebsiteBucket}.s3-website-${AWS::Region}.amazonaws.com"
+
+  StackName:
+    Description: "Name of the stack"
+    Value: !Ref AWS::StackName
